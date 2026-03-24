@@ -6,6 +6,9 @@
     <a href="https://www.npmjs.com/package/@cli-creator/clix"><img src="https://img.shields.io/npm/v/@cli-creator/clix" alt="npm"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
   </p>
+  <p>
+    <a href="README.md">English</a> | <a href="README_zh.md">中文</a>
+  </p>
 </div>
 
 Give `clix` an API document — Markdown, HTML, PDF, or a URL — and it will parse the endpoints, extract parameters, generate a fully working CLI, and install it to your PATH. Or point it at any executable binary and get an instant wrapper CLI with full flag passthrough. No boilerplate, no code generation templates to maintain.
