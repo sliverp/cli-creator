@@ -8,7 +8,9 @@
   </p>
 </div>
 
-Give `clix` an API document — Markdown, HTML, PDF, or a URL — and it will parse the endpoints, extract parameters, generate a fully working CLI, and install it to your PATH. No boilerplate, no code generation templates to maintain.
+Give `clix` an API document — Markdown, HTML, PDF, or a URL — and it will parse the endpoints, extract parameters, generate a fully working CLI, and install it to your PATH. Or point it at any executable binary and get an instant wrapper CLI with full flag passthrough. No boilerplate, no code generation templates to maintain.
+
+### Document Mode (API → CLI)
 
 ```text
                   ┌──────────────┐
@@ -34,12 +36,38 @@ Give `clix` an API document — Markdown, HTML, PDF, or a URL — and it will pa
               └─────────────────────┘
 ```
 
+### Command Mode (Executable → CLI)
+
+```text
+                  ┌──────────────┐
+                  │  /bin/codex   │   Any executable binary
+                  └──────┬───────┘
+                         │
+                         ▼
+  ┌─────────────────────────────────────────────┐
+  │   clix build ai-tools --from /bin/codex     │
+  │                                             │
+  │  1. Detect executable (access + which)      │
+  │  2. Create command-type action              │
+  │  3. Generate CLI wrapper + manifest         │
+  │  4. Install shim to PATH                   │
+  └─────────────────────────────────────────────┘
+                         │
+                         ▼
+              ┌─────────────────────┐
+              │  ai-tools codex     │   Flags pass through
+              │    --model o3       │   to the inner binary
+              │    --help           │   (including --help)
+              └─────────────────────┘
+```
+
 ---
 
 ## Table of Contents
 
 - [Features](#features)
 - [Quick Start](#quick-start)
+- [Command Mode](#command-mode)
 - [How It Works](#how-it-works)
 - [Commands](#commands)
 - [Generated CLI](#generated-cli)
