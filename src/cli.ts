@@ -538,6 +538,7 @@ async function handleUpdateEdit(name: string, rest: string[]): Promise<void> {
     host: 'string',
     'request-path': 'string',
     headers: 'string',
+    bin: 'string',
     yes: 'boolean',
   });
 
@@ -546,18 +547,23 @@ async function handleUpdateEdit(name: string, rest: string[]): Promise<void> {
     console.log('');
     console.log('编辑 action 配置。不指定选项时进入交互式编辑。');
     console.log('');
-    console.log('Options:');
+    console.log('Options (request 类型):');
     console.log('  --description <desc>    action 描述');
     console.log('  --method <method>       HTTP 方法');
     console.log('  --host <host>           请求 Host');
     console.log('  --request-path <path>   请求 Path');
     console.log('  --headers <json>        默认请求头（JSON 对象）');
+    console.log('');
+    console.log('Options (command 类型):');
+    console.log('  --description <desc>    action 描述');
+    console.log('  --bin <path>            可执行文件路径');
+    console.log('');
     console.log('  --yes                   跳过确认提示');
     console.log('  -h, --help              显示帮助信息');
     console.log('');
     console.log('示例:');
     console.log(`  clix update ${name} edit cdb/StartCpuExpand --description "新描述"`);
-    console.log(`  clix update ${name} edit cdb/StartCpuExpand --method GET --host api.example.com`);
+    console.log(`  clix update ${name} edit codex --bin /usr/local/bin/codex`);
     return;
   }
 
@@ -583,6 +589,7 @@ async function handleUpdateEdit(name: string, rest: string[]): Promise<void> {
     host: flags.host as string | undefined,
     requestPath: flags['request-path'] as string | undefined,
     headers: flags.headers ? JSON.parse(flags.headers as string) : undefined,
+    bin: flags.bin as string | undefined,
     yes: Boolean(flags.yes),
   });
 

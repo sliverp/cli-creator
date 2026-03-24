@@ -1,6 +1,6 @@
 <div align="center">
   <h1>clix</h1>
-  <p><strong>Build installable CLIs from API documents. In one command.</strong></p>
+  <p><strong>Build installable CLIs from API documents or executables. In one command.</strong></p>
   <p>
     <img src="https://img.shields.io/badge/node-≥20-blue" alt="Node">
     <a href="https://www.npmjs.com/package/@cli-creator/clix"><img src="https://img.shields.io/npm/v/@cli-creator/clix" alt="npm"></a>
