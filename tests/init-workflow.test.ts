@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { readClixConfig } from '../src/config-store';
 import { runInitWizard } from '../src/init-workflow';
-import type { TuiAdapter, TuiConfirmOptions, TuiInputOptions, TuiSelectOptions } from '../src/tui';
+import type { TuiAdapter, TuiConfirmOptions, TuiInputOptions, TuiMultiSelectOptions, TuiSelectOptions } from '../src/tui';
 
 class ScriptedTui implements TuiAdapter {
   constructor(
@@ -37,6 +37,10 @@ class ScriptedTui implements TuiAdapter {
       throw new Error('missing scripted select');
     }
     return value as T;
+  }
+
+  async multiSelect<T extends string>(_options: TuiMultiSelectOptions<T>): Promise<T[]> {
+    return [];
   }
 }
 

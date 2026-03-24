@@ -56,6 +56,18 @@ export interface BuildCliInput {
   yes?: boolean;
   installBinDir?: string;
   tui?: TuiAdapter;
+  /** If true, allow building even when manifest already exists (used by update). */
+  allowExisting?: boolean;
+  /** CLI flag overrides — takes priority over TUI input and --yes defaults */
+  overrides?: {
+    description?: string;
+    commandPath?: string[];
+    packageName?: string;
+    method?: HttpMethod;
+    host?: string;
+    requestPath?: string;
+    headers?: Record<string, string>;
+  };
 }
 
 export interface BuildCliResult {
@@ -118,6 +130,11 @@ export async function buildCli(input: BuildCliInput): Promise<BuildCliResult> {
     }
     if (!existingManifest) {
       await assertBuildTargetReady(targetDir, input.yes ?? false, adapter);
+    } else if (!input.allowExisting) {
+      throw new Error(
+        `CLI "${input.name}" 已存在（${manifestFilePath}）。\n` +
+        `如果要增量添加 action，请使用: clix update ${input.name} --from <source>`,
+      );
     }
     debugLog(input.verbose, `build target: ${targetDir}`);
 
@@ -132,12 +149,14 @@ export async function buildCli(input: BuildCliInput): Promise<BuildCliResult> {
     debugLog(input.verbose, `draft imported: ${imported.draftFilePath}`);
 
     const plan = input.yes
-      ? createDefaultBuildPlan(input.name, imported.draft, config)
+      ? createDefaultBuildPlan(input.name, imported.draft, config, input.overrides)
       : await collectBuildPlan({
           cliName: input.name,
           draft: imported.draft,
           config,
           adapter,
+          existingManifest,
+          overrides: input.overrides,
         });
 
     const updatedDraft: ExtractedActionDraft = {
@@ -227,6 +246,310 @@ export async function buildCli(input: BuildCliInput): Promise<BuildCliResult> {
   }
 }
 
+export async function getCliManifest(name: string): Promise<GeneratedCliManifest | null> {
+  const record = await getBuiltCliRecord(name);
+  if (!record) {
+    return null;
+  }
+  try {
+    return await readJson<GeneratedCliManifest>(record.manifestFilePath);
+  } catch {
+    return null;
+  }
+}
+
+// ── Delete actions ────────────────────────────────────────────────────
+
+export interface DeleteActionsInput {
+  name: string;
+  /** Action paths to delete, each as slash-separated string e.g. "cdb/StartCpuExpand" */
+  actionPaths: string[];
+  yes?: boolean;
+  tui?: TuiAdapter;
+}
+
+export async function deleteActions(input: DeleteActionsInput): Promise<GeneratedCliManifest> {
+  const record = await getBuiltCliRecord(input.name);
+  if (!record) {
+    throw new Error(`CLI "${input.name}" 尚未构建。`);
+  }
+  const manifest = await readJson<GeneratedCliManifest>(record.manifestFilePath);
+
+  const pathsToDelete = input.actionPaths.map((p) => p.replace(/\//g, ' '));
+  const toDelete = manifest.actions.filter((a) =>
+    pathsToDelete.includes(a.commandPath.join(' ')),
+  );
+
+  if (toDelete.length === 0) {
+    const available = manifest.actions.map((a) => a.commandPath.join('/')).join(', ');
+    throw new Error(`未找到匹配的 action。可用: ${available}`);
+  }
+
+  if (!input.yes) {
+    const adapter = input.tui ?? new ReadlineTuiAdapter();
+    try {
+      console.log('将删除以下 action:');
+      for (const a of toDelete) {
+        console.log(`  - ${a.commandPath.join('/')} — ${a.description || ''}`);
+      }
+      const confirmed = await adapter.confirm({
+        message: `确认删除 ${toDelete.length} 个 action？`,
+        defaultValue: false,
+      });
+      if (!confirmed) {
+        throw new Error('用户取消删除。');
+      }
+    } finally {
+      if (!input.tui) {
+        adapter.close?.();
+      }
+    }
+  }
+
+  const remaining = manifest.actions.filter((a) =>
+    !pathsToDelete.includes(a.commandPath.join(' ')),
+  );
+
+  if (remaining.length === 0) {
+    throw new Error('不能删除所有 action，至少需要保留一个。');
+  }
+
+  const updated: GeneratedCliManifest = { ...manifest, actions: remaining };
+  await regenerateCli(input.name, updated);
+  return updated;
+}
+
+// ── Move action ───────────────────────────────────────────────────────
+
+export interface MoveActionInput {
+  name: string;
+  /** Source action path, slash-separated e.g. "cdb/StartCpuExpand" */
+  actionPath: string;
+  /** New path, slash-separated e.g. "mysql/StartCpuExpand" */
+  newPath: string;
+  yes?: boolean;
+  tui?: TuiAdapter;
+}
+
+export async function moveAction(input: MoveActionInput): Promise<GeneratedCliManifest> {
+  const record = await getBuiltCliRecord(input.name);
+  if (!record) {
+    throw new Error(`CLI "${input.name}" 尚未构建。`);
+  }
+  const manifest = await readJson<GeneratedCliManifest>(record.manifestFilePath);
+
+  const sourcePath = input.actionPath.replace(/\//g, ' ');
+  const action = manifest.actions.find((a) => a.commandPath.join(' ') === sourcePath);
+  if (!action) {
+    const available = manifest.actions.map((a) => a.commandPath.join('/')).join(', ');
+    throw new Error(`未找到 action: ${input.actionPath}。可用: ${available}`);
+  }
+
+  const newCommandPath = input.newPath.split('/').map((s) => s.trim()).filter(Boolean);
+  if (newCommandPath.length === 0) {
+    throw new Error('新路径不能为空。');
+  }
+
+  const newPathStr = newCommandPath.join(' ');
+  const conflict = manifest.actions.find((a) =>
+    a.commandPath.join(' ') === newPathStr && a !== action,
+  );
+  if (conflict) {
+    throw new Error(`目标路径 ${input.newPath} 已被占用。`);
+  }
+
+  if (!input.yes) {
+    const adapter = input.tui ?? new ReadlineTuiAdapter();
+    try {
+      const confirmed = await adapter.confirm({
+        message: `将 ${input.actionPath} 移动到 ${input.newPath}？`,
+        defaultValue: true,
+      });
+      if (!confirmed) {
+        throw new Error('用户取消移动。');
+      }
+    } finally {
+      if (!input.tui) {
+        adapter.close?.();
+      }
+    }
+  }
+
+  action.commandPath = newCommandPath;
+
+  const updated: GeneratedCliManifest = { ...manifest };
+  await regenerateCli(input.name, updated);
+  return updated;
+}
+
+// ── Edit action ───────────────────────────────────────────────────────
+
+export interface EditActionInput {
+  name: string;
+  /** Action path, slash-separated */
+  actionPath: string;
+  /** Partial overrides */
+  description?: string;
+  method?: HttpMethod;
+  host?: string;
+  requestPath?: string;
+  headers?: Record<string, string>;
+  yes?: boolean;
+  tui?: TuiAdapter;
+}
+
+export async function editAction(input: EditActionInput): Promise<GeneratedCliManifest> {
+  const record = await getBuiltCliRecord(input.name);
+  if (!record) {
+    throw new Error(`CLI "${input.name}" 尚未构建。`);
+  }
+  const manifest = await readJson<GeneratedCliManifest>(record.manifestFilePath);
+
+  const sourcePath = input.actionPath.replace(/\//g, ' ');
+  const action = manifest.actions.find((a) => a.commandPath.join(' ') === sourcePath);
+  if (!action) {
+    const available = manifest.actions.map((a) => a.commandPath.join('/')).join(', ');
+    throw new Error(`未找到 action: ${input.actionPath}。可用: ${available}`);
+  }
+
+  // Apply overrides from CLI flags
+  if (input.description !== undefined) action.description = input.description;
+  if (input.method !== undefined) action.endpoint.method = input.method;
+  if (input.host !== undefined) action.endpoint.host = input.host;
+  if (input.requestPath !== undefined) action.endpoint.path = input.requestPath;
+  if (input.headers !== undefined) action.endpoint.headers = { ...action.endpoint.headers, ...input.headers };
+
+  // If no flags provided, enter TUI mode
+  const hasFlags = input.description !== undefined || input.method !== undefined
+    || input.host !== undefined || input.requestPath !== undefined || input.headers !== undefined;
+
+  if (!hasFlags && !input.yes) {
+    const adapter = input.tui ?? new ReadlineTuiAdapter();
+    try {
+      action.description = await adapter.input({
+        message: '描述',
+        defaultValue: action.description,
+      });
+      action.endpoint.method = await adapter.select<HttpMethod>({
+        message: 'HTTP Method',
+        defaultValue: action.endpoint.method,
+        choices: (['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'] as HttpMethod[]).map((m) => ({ value: m, label: m })),
+      });
+      action.endpoint.host = await adapter.input({
+        message: '请求 Host',
+        defaultValue: action.endpoint.host,
+        validate: (v) => (v.trim() ? undefined : 'Host 不能为空。'),
+      });
+      action.endpoint.path = await adapter.input({
+        message: '请求 Path',
+        defaultValue: action.endpoint.path,
+        validate: (v) => (v.trim() ? undefined : 'Path 不能为空。'),
+      });
+      const headersText = await adapter.input({
+        message: '默认请求头（JSON 对象）',
+        defaultValue: JSON.stringify(action.endpoint.headers),
+        validate: (v) => {
+          try { JSON.parse(v); return undefined; } catch (e) { return String(e); }
+        },
+      });
+      action.endpoint.headers = JSON.parse(headersText);
+    } finally {
+      if (!input.tui) {
+        adapter.close?.();
+      }
+    }
+  }
+
+  const updated: GeneratedCliManifest = { ...manifest };
+  await regenerateCli(input.name, updated);
+  return updated;
+}
+
+// ── Regenerate CLI entry + manifest ───────────────────────────────────
+
+export async function regenerateCli(name: string, manifest: GeneratedCliManifest): Promise<void> {
+  const record = await getBuiltCliRecord(name);
+  if (!record) {
+    throw new Error(`CLI "${name}" 尚未构建。`);
+  }
+  const targetDir = record.targetDir;
+  await writeGeneratedPackage({
+    targetDir,
+    cliName: name,
+    packageName: manifest.packageName,
+    manifest,
+  });
+}
+
+export function formatCommandTree(manifest: GeneratedCliManifest): string {
+  interface TreeNode { children: Record<string, TreeNode>; action?: GeneratedCliAction }
+  const root: TreeNode = { children: {} };
+  for (const action of manifest.actions) {
+    let node = root;
+    for (const seg of action.commandPath) {
+      if (!node.children[seg]) {
+        node.children[seg] = { children: {} };
+      }
+      node = node.children[seg];
+    }
+    node.action = action;
+  }
+
+  const lines: string[] = [];
+  lines.push(`${manifest.cliName} (${manifest.actions.length} action${manifest.actions.length > 1 ? 's' : ''})`);
+
+  function walk(node: TreeNode, prefix: string, isRoot: boolean) {
+    const keys = Object.keys(node.children);
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      const child = node.children[key];
+      const last = i === keys.length - 1;
+      const connector = last ? '└── ' : '├── ';
+      const childPrefix = last ? '    ' : '│   ';
+      const desc = child.action ? ` — ${child.action.description || ''}` : '';
+      const leafMarker = child.action ? ' ●' : '';
+      lines.push(`${prefix}${connector}${key}${leafMarker}${desc}`);
+      walk(child, prefix + childPrefix, false);
+    }
+  }
+  walk(root, '', true);
+  return lines.join('\n');
+}
+
+function manifestToTreePickerNode(manifest: GeneratedCliManifest): import('./tui').TreePickerNode {
+  interface InternalNode {
+    children: Record<string, InternalNode>;
+    isAction?: boolean;
+    hint?: string;
+    path: string[];
+  }
+  const root: InternalNode = { children: {}, path: [] };
+  for (const action of manifest.actions) {
+    let node = root;
+    for (let i = 0; i < action.commandPath.length; i++) {
+      const seg = action.commandPath[i];
+      if (!node.children[seg]) {
+        node.children[seg] = { children: {}, path: action.commandPath.slice(0, i + 1) };
+      }
+      node = node.children[seg];
+    }
+    node.isAction = true;
+    node.hint = action.description;
+  }
+
+  function convert(node: InternalNode, label: string): import('./tui').TreePickerNode {
+    return {
+      label,
+      path: node.path,
+      isAction: node.isAction,
+      hint: node.hint,
+      children: Object.entries(node.children).map(([key, child]) => convert(child, key)),
+    };
+  }
+
+  return convert(root, manifest.cliName);
+}
+
 export async function publishCli(input: PublishCliInput): Promise<PublishCliResult> {
   const { config } = await initClixHome();
   const record = await getBuiltCliRecord(input.name);
@@ -299,15 +622,20 @@ async function assertBuildTargetReady(targetDir: string, yes: boolean, adapter: 
   }
 }
 
-function createDefaultBuildPlan(name: string, draft: ExtractedActionDraft, config: Awaited<ReturnType<typeof readClixConfig>>): BuildPlan {
+function createDefaultBuildPlan(
+  name: string,
+  draft: ExtractedActionDraft,
+  config: Awaited<ReturnType<typeof readClixConfig>>,
+  overrides?: BuildCliInput['overrides'],
+): BuildPlan {
   return {
-    description: draft.description?.trim() || `${name} generated CLI`,
-    packageName: defaultPackageName(name, config.defaults.packageScope),
-    commandPath: [draft.service, draft.action],
-    method: draft.method ?? 'POST',
-    host: draft.host ?? 'example.com',
-    path: draft.path ?? '/',
-    headers: inferDefaultHeaders(draft),
+    description: overrides?.description ?? (draft.description?.trim() || `${name} generated CLI`),
+    packageName: overrides?.packageName ?? defaultPackageName(name, config.defaults.packageScope),
+    commandPath: overrides?.commandPath ?? [draft.service, draft.action],
+    method: overrides?.method ?? draft.method ?? 'POST',
+    host: overrides?.host ?? draft.host ?? 'example.com',
+    path: overrides?.requestPath ?? draft.path ?? '/',
+    headers: overrides?.headers ?? inferDefaultHeaders(draft),
     params: draft.params,
   };
 }
@@ -317,54 +645,86 @@ async function collectBuildPlan(args: {
   draft: ExtractedActionDraft;
   config: Awaited<ReturnType<typeof readClixConfig>>;
   adapter: TuiAdapter;
+  existingManifest?: GeneratedCliManifest | null;
+  overrides?: BuildCliInput['overrides'];
 }): Promise<BuildPlan> {
-  const { cliName, draft, config, adapter } = args;
+  const { cliName, draft, config, adapter, existingManifest, overrides } = args;
 
-  const description = await adapter.input({
+  const description = overrides?.description ?? await adapter.input({
     message: '确认 CLI 描述',
     defaultValue: draft.description?.trim() || `${cliName} generated CLI`,
     validate: (value) => (value.trim() ? undefined : '描述不能为空。'),
   });
 
-  const hierarchyText = await adapter.input({
-    message: '确认功能层级（使用空格分隔命令层级）',
-    defaultValue: `${draft.service} ${draft.action}`,
-    validate: (value) => validateCommandPath(value),
-  });
+  let commandPath: string[];
 
-  const packageName = await adapter.input({
+  if (overrides?.commandPath) {
+    commandPath = overrides.commandPath;
+  } else if (existingManifest && existingManifest.actions.length > 0) {
+    // Use interactive tree picker when updating an existing CLI
+    const { pickTreeInsertionPoint } = await import('./tui');
+    const treeRoot = manifestToTreePickerNode(existingManifest);
+    const newActionName = draft.action || 'NewAction';
+
+    // Destroy the adapter's readline interface before entering raw-mode
+    // tree picker so they don't compete for stdin.
+    adapter.close?.();
+
+    const parentPath = await pickTreeInsertionPoint({
+      message: '选择新 action 的插入位置',
+      root: treeRoot,
+      newActionName,
+    });
+    commandPath = [...parentPath, newActionName];
+  } else {
+    // First build: use text input
+    const hierarchyText = await adapter.input({
+      message: '确认功能层级（使用空格分隔命令层级）',
+      defaultValue: `${draft.service} ${draft.action}`,
+      validate: (value) => validateCommandPath(value),
+    });
+    commandPath = hierarchyText.trim().split(/\s+/);
+  }
+
+  const packageName = overrides?.packageName ?? await adapter.input({
     message: '确认 npm 包名',
     defaultValue: defaultPackageName(cliName, config.defaults.packageScope),
     validate: (value) => validatePackageName(value),
   });
 
-  const method = await adapter.select<HttpMethod>({
+  const method = overrides?.method ?? await adapter.select<HttpMethod>({
     message: '请选择 HTTP Method',
     defaultValue: draft.method ?? 'POST',
     choices: HTTP_METHODS.map((item) => ({ value: item, label: item })),
   });
 
-  const host = await adapter.input({
+  const host = overrides?.host ?? await adapter.input({
     message: '确认请求 Host',
     defaultValue: draft.host ?? '',
     validate: (value) => (value.trim() ? undefined : 'Host 不能为空。'),
   });
 
-  const requestPath = await adapter.input({
+  const requestPath = overrides?.requestPath ?? await adapter.input({
     message: '确认请求 Path',
     defaultValue: draft.path ?? '/',
     validate: (value) => (value.trim() ? undefined : 'Path 不能为空。'),
   });
 
-  const headersText = await adapter.input({
-    message: '确认默认请求头（JSON 对象）',
-    defaultValue: JSON.stringify(inferDefaultHeaders(draft)),
-    validate: (value) => validateHeaderJson(value),
-  });
+  let headers: Record<string, string>;
+  if (overrides?.headers) {
+    headers = overrides.headers;
+  } else {
+    const headersText = await adapter.input({
+      message: '确认默认请求头（JSON 对象）',
+      defaultValue: JSON.stringify(inferDefaultHeaders(draft)),
+      validate: (value) => validateHeaderJson(value),
+    });
+    headers = parseHeaderJson(headersText);
+  }
 
   const params = await reviewParams(draft.params, adapter);
   const summary = [
-    `层级: ${hierarchyText.trim()}`,
+    `层级: ${commandPath.join(' ')}`,
     `方法: ${method}`,
     `地址: ${host}${requestPath}`,
     `参数数: ${params.length}`,
@@ -383,51 +743,44 @@ async function collectBuildPlan(args: {
   return {
     description: description.trim(),
     packageName: packageName.trim(),
-    commandPath: hierarchyText.trim().split(/\s+/),
+    commandPath,
     method,
     host: host.trim(),
     path: requestPath.trim(),
-    headers: parseHeaderJson(headersText),
+    headers,
     params,
   };
 }
 
 async function reviewParams(params: ParamSpec[], adapter: TuiAdapter): Promise<ParamSpec[]> {
-  const reviewed: ParamSpec[] = [];
+  if (params.length === 0) return [];
 
-  for (const param of params) {
-    const keep = await adapter.confirm({
-      message: `保留参数 ${param.name} 吗？类型=${param.type}，当前${param.required ? '必填' : '可选'}`,
-      defaultValue: true,
-    });
-    if (!keep) {
-      continue;
-    }
+  const { editParamsTable } = await import('./tui');
 
-    const required = await adapter.confirm({
-      message: `参数 ${param.name} 是否必填？`,
-      defaultValue: param.required,
-    });
+  // Destroy the adapter's readline interface before entering raw-mode
+  // table editor so they don't compete for stdin.
+  adapter.close?.();
 
-    const location = await adapter.select<ParamSpec['location']>({
-      message: `参数 ${param.name} 的位置`,
-      defaultValue: param.location,
-      choices: [
-        { value: 'body', label: 'body' },
-        { value: 'query', label: 'query' },
-        { value: 'header', label: 'header' },
-        { value: 'path', label: 'path' },
-      ],
-    });
+  const result = await editParamsTable(
+    params.map((p) => ({
+      name: p.name,
+      type: p.type,
+      required: p.required,
+      location: p.location,
+      description: p.description,
+    })),
+  );
 
-    reviewed.push({
-      ...param,
-      required,
-      location,
-    });
-  }
-
-  return reviewed;
+  return result.map((r) => {
+    const original = params.find((p) => p.name === r.name);
+    return {
+      ...(original ?? { name: r.name, enum: undefined }),
+      type: r.type as ParamSpec['type'],
+      required: r.required,
+      location: r.location,
+      description: r.description,
+    };
+  });
 }
 
 function createAction(args: {
@@ -650,23 +1003,64 @@ function renderGeneratedCliEntry(): string {
     '    console.error(errorMessage);',
     "    console.error('');",
     '  }',
-    '  const subcommands = Object.keys(node.children);',
-    '  if (subcommands.length > 0) {',
-    "    console.log(prefix.length > 0 ? prefix.join(' ') + ' - available subcommands:' : (manifest.description || manifest.cliName + ' CLI'));",
-    "    console.log('');",
-    '    for (const sub of subcommands) {',
-    '      // Collect all leaf action descriptions under this subcommand',
-    '      const childNode = node.children[sub];',
-    '      const leafActions = getAllLeafActions(childNode);',
-    "      const desc = leafActions.length === 1 ? leafActions[0].description : leafActions.length + ' actions';",
-    "      console.log('  ' + sub + '  (' + desc + ')');",
+    "  console.log(prefix.length > 0 ? prefix.join(' ') + ' - available subcommands:' : (manifest.description || manifest.cliName + ' CLI'));",
+    "  console.log('');",
+    '  // Flatten a chain of single-child nodes into one label, e.g. "Ecs / RunInstances"',
+    '  function collectEntries(nd) {',
+    '    var entries = [];',
+    '    var subs = Object.keys(nd.children);',
+    '    for (var s = 0; s < subs.length; s++) {',
+    '      var sub = subs[s];',
+    '      var child = nd.children[sub];',
+    '      // Collapse single-child intermediate nodes',
+    '      var label = sub;',
+    '      var cur = child;',
+    '      while (Object.keys(cur.children).length === 1 && cur.actions.length === 0) {',
+    '        var onlyKey = Object.keys(cur.children)[0];',
+    "        label += ' / ' + onlyKey;",
+    '        cur = cur.children[onlyKey];',
+    '      }',
+    '      // cur is either a branching node or a leaf',
+    '      var leafActions = getAllLeafActions(cur);',
+    '      if (cur.actions.length === 1 && Object.keys(cur.children).length === 0) {',
+    '        // Terminal action — show description and required params inline',
+    '        var action = cur.actions[0];',
+    "        var desc = action.description ? ' — ' + action.description : '';",
+    '        var params = action.params || [];',
+    "        var reqParams = params.filter(function(p) { return p.required; });",
+    "        var paramHint = reqParams.length > 0 ? ' [' + reqParams.map(function(p) { return p.flag; }).join(', ') + ']' : '';",
+    "        entries.push({ label: label + desc + paramHint, children: null });",
+    '      } else {',
+    "        var countStr = leafActions.length > 0 ? ' (' + leafActions.length + ' action' + (leafActions.length > 1 ? 's' : '') + ')' : '';",
+    '        entries.push({ label: label + countStr, children: cur });',
+    '      }',
     '    }',
-    "    console.log('');",
-    "    console.log('Run ' + [manifest.cliName].concat(prefix).concat(['<subcommand>', '--help']).join(' ') + ' for more info.');",
-    '  } else if (node.actions.length > 0) {',
-    '    // Leaf node — show action help',
-    '    printActionHelp(node.actions[0]);',
+    '    // Actions directly on this node (rare but possible)',
+    '    for (var a = 0; a < nd.actions.length; a++) {',
+    '      var action = nd.actions[a];',
+    "      var desc = action.description ? ' — ' + action.description : '';",
+    '      var params = action.params || [];',
+    "      var reqParams = params.filter(function(p) { return p.required; });",
+    "      var paramHint = reqParams.length > 0 ? ' [' + reqParams.map(function(p) { return p.flag; }).join(', ') + ']' : '';",
+    '      entries.push({ label: action.commandPath[action.commandPath.length - 1] + desc + paramHint, children: null });',
+    '    }',
+    '    return entries;',
     '  }',
+    '  function printTree(nd, indent) {',
+    '    var entries = collectEntries(nd);',
+    '    for (var i = 0; i < entries.length; i++) {',
+    '      var isLast = i === entries.length - 1;',
+    "      var connector = isLast ? '└── ' : '├── ';",
+    "      var childIndent = indent + (isLast ? '    ' : '│   ');",
+    '      console.log(indent + connector + entries[i].label);',
+    '      if (entries[i].children) {',
+    '        printTree(entries[i].children, childIndent);',
+    '      }',
+    '    }',
+    '  }',
+    "  printTree(node, '  ');",
+    "  console.log('');",
+    "  console.log('Run ' + [manifest.cliName].concat(prefix).concat(['<subcommand>', '--help']).join(' ') + ' for more info.');",
     '}',
     '',
     'function getAllLeafActions(node) {',
@@ -857,7 +1251,18 @@ function renderGeneratedCliEntry(): string {
     '',
     '  const matched = matchAction(argv.filter((a) => a !== \'-h\' && a !== \'--help\'));',
     '  if (!matched) {',
-    "    printLevelHelp([], tree, '未匹配到任何 action，请检查命令层级。');",
+    '    // Walk tree to find the deepest matching level for helpful error',
+    '    let node = tree;',
+    '    const consumed = [];',
+    '    for (const seg of nonHelpArgv) {',
+    '      if (node.children[seg]) {',
+    '        consumed.push(seg);',
+    '        node = node.children[seg];',
+    '      } else {',
+    '        break;',
+    '      }',
+    '    }',
+    "    printLevelHelp(consumed, node, '未匹配到完整的 action，请补全子命令。');",
     '    process.exitCode = 1;',
     '    return;',
     '  }',

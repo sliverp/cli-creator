@@ -188,6 +188,24 @@ export async function runInitWizard(input: { tui?: TuiAdapter } = {}) {
   const ownsAdapter = !input.tui;
 
   try {
+    // Show current config when re-running
+    if (!created) {
+      console.log('');
+      console.log('当前配置:');
+      console.log(`  llm.provider:       ${config.llm.provider}`);
+      console.log(`  llm.model:          ${config.llm.model}`);
+      console.log(`  llm.baseUrl:        ${config.llm.baseUrl ?? '(empty)'}`);
+      if (config.llm.apiKey) {
+        console.log(`  llm.apiKey:         ${maskSecret(config.llm.apiKey)}`);
+      } else {
+        console.log(`  llm.apiKeyEnvName:  ${config.llm.apiKeyEnvName ?? '(empty)'}`);
+      }
+      console.log(`  defaults.packageScope: ${config.defaults.packageScope ?? '(empty)'}`);
+      console.log(`  defaults.publishTag:   ${config.defaults.publishTag}`);
+      console.log(`  defaults.npmAccess:    ${config.defaults.npmAccess}`);
+      console.log('');
+    }
+
     const provider = await adapter.select({
       message: '请选择默认大模型提供方',
       defaultValue: resolveProviderDefault(config.llm.provider),

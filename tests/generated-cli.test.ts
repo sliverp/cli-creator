@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { getBuiltCliRecord } from '../src/config-store';
 import { buildCli } from '../src/generated-cli';
-import type { TuiAdapter, TuiConfirmOptions, TuiInputOptions, TuiSelectOptions } from '../src/tui';
+import type { TuiAdapter, TuiConfirmOptions, TuiInputOptions, TuiMultiSelectOptions, TuiSelectOptions } from '../src/tui';
 
 const execFileAsync = promisify(execFile);
 
@@ -41,6 +41,10 @@ class ScriptedTui implements TuiAdapter {
       throw new Error('missing scripted select');
     }
     return value as T;
+  }
+
+  async multiSelect<T extends string>(_options: TuiMultiSelectOptions<T>): Promise<T[]> {
+    return [];
   }
 }
 

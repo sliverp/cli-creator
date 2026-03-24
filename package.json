@@ -13,7 +13,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "clix": "tsx src/index.ts --",
+    "clix": "tsx src/index.ts",
     "build": "tsup src/index.ts --format cjs --target node20 --clean --out-dir dist --dts --shims",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

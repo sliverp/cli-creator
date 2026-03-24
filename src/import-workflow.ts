@@ -717,6 +717,18 @@ async function extractDraft(args: {
     !draft.path ? 'path' : null,
   ].filter(Boolean);
 
+  // If the document is not a well-structured API doc (many missing fields)
+  // and no AI extractor processed it, reject with a helpful message.
+  if (!aiPatch && blockingMissingFields.length >= 2 && document.sourceType === 'url') {
+    throw new Error(
+      `该 URL 返回的内容不是格式化的 API 文档（缺少: ${blockingMissingFields.join(', ')}）。\n\n` +
+      `clix 尝试用 AI 提取但未成功。请检查:\n` +
+      `  1. 运行 clix init 确认已配置 LLM（provider/model/apiKey/baseUrl）\n` +
+      `  2. 确认 API Key 有效且网络可达\n\n` +
+      `也可以手动将接口信息整理为 Markdown 格式的本地文件，再用 --from 指定。`,
+    );
+  }
+
   if (mode === 'strict' && blockingMissingFields.length > 0) {
     throw new Error(`strict 模式导入失败，缺少关键字段：${blockingMissingFields.join(', ')}`);
   }
@@ -733,23 +745,165 @@ async function maybeApplyAiPatch(
     return null;
   }
 
+  // 1) Try custom extractor module (env var)
   const modulePath = process.env.CLIX_AI_EXTRACTOR?.trim();
-  if (!modulePath) {
+  if (modulePath) {
+    const importTarget = modulePath.startsWith('.') || modulePath.startsWith('/')
+      ? pathToFileURL(path.resolve(modulePath)).href
+      : modulePath;
+
+    const aiModule = await import(importTarget);
+    const extractor = typeof aiModule.default === 'function' ? aiModule.default : aiModule.extract;
+    if (typeof extractor !== 'function') {
+      throw new Error('CLIX_AI_EXTRACTOR 模块未导出 default/extract 函数。');
+    }
+
+    const patch = await extractor({ document, draft });
+    return patch ?? null;
+  }
+
+  // 2) Fallback: use LLM configured via `clix init`
+  return callConfiguredLlmExtractor(document, draft);
+}
+
+async function callConfiguredLlmExtractor(
+  document: NormalizedDocument,
+  draft: ExtractedActionDraft,
+): Promise<Partial<ExtractedActionDraft> | null> {
+  const { readClixConfig } = await import('./config-store');
+  const config = await readClixConfig();
+
+  const apiKey = config.llm.apiKey
+    ?? (config.llm.apiKeyEnvName ? process.env[config.llm.apiKeyEnvName]?.trim() : undefined);
+
+  if (!apiKey || !config.llm.baseUrl) {
+    // No LLM configured — cannot do AI extraction
     return null;
   }
 
-  const importTarget = modulePath.startsWith('.') || modulePath.startsWith('/')
-    ? pathToFileURL(path.resolve(modulePath)).href
-    : modulePath;
+  const baseUrl = config.llm.baseUrl.replace(/\/+$/, '');
+  const model = config.llm.model;
 
-  const aiModule = await import(importTarget);
-  const extractor = typeof aiModule.default === 'function' ? aiModule.default : aiModule.extract;
-  if (typeof extractor !== 'function') {
-    throw new Error('CLIX_AI_EXTRACTOR 模块未导出 default/extract 函数。');
+  // Truncate rawText to avoid token overflow (keep first ~8000 chars)
+  const maxChars = 8000;
+  const truncatedText = document.rawText.length > maxChars
+    ? document.rawText.slice(0, maxChars) + '\n...(truncated)'
+    : document.rawText;
+
+  const systemPrompt = `You are an API documentation analyzer. Extract structured API information from the given document content.
+Return a valid JSON object with these fields (omit any field you cannot determine):
+- "action": string — the API action/operation name (e.g. "RunInstances", "CreateBucket")
+- "description": string — a brief one-line description of what this API does
+- "method": string — HTTP method (GET/POST/PUT/DELETE/PATCH), use "POST" if the doc says RPC-style
+- "host": string — the API endpoint host (e.g. "ecs.aliyuncs.com")
+- "path": string — the API path (e.g. "/", "/v2/instances"), use "/" for RPC-style APIs
+- "service": string — the service/product name (e.g. "ecs", "cdb", "s3")
+- "params": array of objects with { "name": string, "type": "string"|"number"|"boolean"|"array"|"object", "required": boolean, "description": string, "location": "query"|"body"|"path"|"header" }
+
+Rules:
+- For cloud provider RPC APIs (like Alibaba Cloud, Tencent Cloud), method is typically "POST" and path is "/".
+- Only return the JSON object, no markdown fences, no explanation.
+- Extract at most 30 most important parameters.
+- Parameter descriptions should be concise (< 50 chars).`;
+
+  const userPrompt = `Document title: ${document.title ?? '(unknown)'}
+Source: ${document.sourceLabel}
+
+Content:
+${truncatedText}`;
+
+  const { createFakeProgressBar } = await import('./tui');
+  const progress = createFakeProgressBar({
+    label: `正在用 AI 分析文档 (${config.llm.provider}/${model})`,
+    duration: 30000,
+  });
+
+  try {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.1,
+        max_tokens: 4096,
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => '');
+      progress.fail(`AI 请求失败 (${response.status})`);
+      console.error(`[clix] ${errorText.slice(0, 200)}`);
+      return null;
+    }
+
+    const data = await response.json() as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+
+    const content = data.choices?.[0]?.message?.content?.trim();
+    if (!content) {
+      progress.fail('AI 返回内容为空');
+      return null;
+    }
+
+    // Strip markdown fences if present
+    const jsonStr = content.replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+    const parsed = JSON.parse(jsonStr) as Record<string, unknown>;
+
+    const patch: Partial<ExtractedActionDraft> = {
+      source: 'ai',
+      evidence: [{ kind: 'ai', snippet: `LLM: ${config.llm.provider}/${model}` }],
+    };
+
+    if (typeof parsed.action === 'string' && parsed.action) {
+      patch.action = parsed.action;
+    }
+    if (typeof parsed.description === 'string' && parsed.description) {
+      patch.description = parsed.description;
+    }
+    if (typeof parsed.method === 'string' && /^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)$/i.test(parsed.method)) {
+      patch.method = parsed.method.toUpperCase() as HttpMethod;
+    }
+    if (typeof parsed.host === 'string' && parsed.host) {
+      patch.host = parsed.host;
+    }
+    if (typeof parsed.path === 'string' && parsed.path) {
+      patch.path = parsed.path;
+    }
+    if (typeof parsed.service === 'string' && parsed.service) {
+      patch.service = parsed.service;
+    }
+    if (Array.isArray(parsed.params)) {
+      patch.params = (parsed.params as Array<Record<string, unknown>>)
+        .filter((p) => typeof p.name === 'string')
+        .map((p) => ({
+          name: String(p.name),
+          type: (['string', 'number', 'boolean', 'array', 'object'].includes(String(p.type))
+            ? String(p.type)
+            : 'string') as ParamSpec['type'],
+          required: Boolean(p.required),
+          description: typeof p.description === 'string' ? p.description : undefined,
+          location: (['query', 'body', 'path', 'header'].includes(String(p.location))
+            ? String(p.location)
+            : 'body') as ParamSpec['location'],
+        }));
+    }
+
+    const actionName = patch.action ?? '未知';
+    const paramCount = patch.params?.length ?? 0;
+    progress.done(`提取完成 → ${actionName} (${paramCount} 个参数)`);
+    return patch;
+  } catch (err) {
+    progress.fail(`AI 提取失败: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
   }
-
-  const patch = await extractor({ document, draft });
-  return patch ?? null;
 }
 
 function mergeDraftPatch(
