@@ -13,10 +13,13 @@ import {
   upsertBuiltCliRecord,
 } from './config-store';
 import { getGlobalBinDir } from './self-management';
-import type { ExtractedActionDraft, HttpMethod, ParamSpec } from './types';
+import type { ExtractedActionDraft, HttpMethod, ParamSpec, SdkLanguage } from './types';
+import { parseSdkSource } from './types';
 import type { TuiAdapter } from './tui';
 import { ReadlineTuiAdapter } from './tui';
 import { ensureDir, readJson, writeJson } from './utils';
+import { detectSdk, extractSdkActions, fetchRemotePackage, type SdkDetection, type SdkActionDraft as SdkExtractedAction } from './sdk-extractor';
+import { generateSdkWrapper, writeSdkWrapper } from './sdk-codegen';
 
 const execFileAsync = promisify(execFile);
 const HTTP_METHODS: HttpMethod[] = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS'];
@@ -37,7 +40,19 @@ export interface CommandEndpoint {
   env?: Record<string, string>;
 }
 
-export type ActionEndpoint = RequestEndpoint | CommandEndpoint;
+export interface SdkEndpoint {
+  type: 'sdk';
+  language: SdkLanguage;
+  wrapperDir: string;
+  buildCommand: string;
+  requires: string[];
+  sdkRoot: string;
+  moduleName?: string;
+  callConventionKind?: string;
+  callConventionInferredBy?: string;
+}
+
+export type ActionEndpoint = RequestEndpoint | CommandEndpoint | SdkEndpoint;
 
 export interface GeneratedCliAction {
   commandPath: string[];
@@ -126,13 +141,23 @@ interface BuildPlan {
 export async function buildCli(input: BuildCliInput): Promise<BuildCliResult> {
   validateCliName(input.name);
 
-  // Detect if --from is an executable binary (command mode)
-  const isExec = await isExecutableSource(input.from);
-  if (isExec) {
-    return buildCommandCli(input, isExec);
+  // Parse --from for lang:spec syntax (e.g. "go:./sdk/", "python:requests==1.1.1")
+  const sdkSource = parseSdkSource(input.from);
+  const effectiveFrom = sdkSource ? sdkSource.spec : input.from;
+
+  // SDK mode: explicit lang:spec prefix or auto-detect SDK source
+  const sdkDetection = await detectSdk(effectiveFrom, sdkSource?.language, sdkSource ?? undefined);
+  if (sdkDetection) {
+    return buildSdkCli({ ...input, from: effectiveFrom }, sdkDetection);
   }
 
-  return buildRequestCli(input);
+  // Detect if --from is an executable binary (command mode)
+  const isExec = await isExecutableSource(effectiveFrom);
+  if (isExec) {
+    return buildCommandCli({ ...input, from: effectiveFrom }, isExec);
+  }
+
+  return buildRequestCli({ ...input, from: effectiveFrom });
 }
 
 /** Resolve an executable source: returns { bin, resolvedBin } or null */
@@ -162,6 +187,220 @@ async function isExecutableSource(from: string): Promise<{ bin: string; resolved
   }
 
   return null;
+}
+
+// ── SDK mode ─────────────────────────────────────────────────────────
+
+async function buildSdkCli(
+  input: BuildCliInput,
+  detection: SdkDetection,
+): Promise<BuildCliResult> {
+  const { paths, config } = await initClixHome();
+  const targetDir = path.resolve(input.to ?? path.join(paths.appsDir, input.name));
+  const installBinDir = input.installBinDir ?? await getGlobalBinDir();
+  const adapter = input.tui ?? new ReadlineTuiAdapter();
+  const ownsAdapter = !input.tui;
+
+  try {
+    await ensureDir(targetDir);
+    const manifestFilePath = path.join(targetDir, 'clix.manifest.json');
+    let existingManifest: GeneratedCliManifest | null = null;
+    try {
+      existingManifest = await readJson<GeneratedCliManifest>(manifestFilePath);
+    } catch {
+      // No existing manifest
+    }
+    if (!existingManifest) {
+      await assertBuildTargetReady(targetDir, input.yes ?? false, adapter);
+    } else if (!input.allowExisting) {
+      throw new Error(
+        `CLI "${input.name}" 已存在（${manifestFilePath}）。\n` +
+        `如果要增量添加 action，请使用: clix update ${input.name} add --from <source>`,
+      );
+    }
+
+    debugLog(input.verbose, `build target (SDK mode): ${targetDir}`);
+    debugLog(input.verbose, `SDK language: ${detection.language}, root: ${detection.rootDir}`);
+    debugLog(input.verbose, `entry files: ${detection.entryFiles.length}`);
+
+    // If remote package, download source first
+    if (detection.isRemote) {
+      debugLog(input.verbose, `fetching remote package: ${detection.packageSpec}`);
+      await fetchRemotePackage(detection);
+      debugLog(input.verbose, `fetched to: ${detection.rootDir} (${detection.entryFiles.length} files)`);
+    }
+
+    // Extract actions from SDK source
+    const extractedActions = await extractSdkActions(detection);
+    if (extractedActions.length === 0) {
+      throw new Error(
+        `未从 SDK 中提取到任何公开 action。\n` +
+        `检查来源: ${detection.rootDir} (${detection.language})`,
+      );
+    }
+
+    debugLog(input.verbose, `extracted ${extractedActions.length} candidate actions`);
+
+    // Let user select which actions to import (unless --yes)
+    let selectedActions: SdkExtractedAction[];
+    if (input.yes) {
+      selectedActions = extractedActions;
+    } else {
+      const choices = extractedActions.map((a) => ({
+        value: a.name,
+        label: a.name,
+        hint: [
+          a.receiver ? `(${a.receiver})` : '',
+          a.description ?? '',
+          a.params.length > 0 ? `[${a.params.map((p) => p.name).join(', ')}]` : '',
+        ].filter(Boolean).join(' '),
+      }));
+
+      const selected = await adapter.multiSelect({
+        message: `选择要导入的 action（共 ${extractedActions.length} 个，Space 选择，Enter 确认）`,
+        choices,
+        min: 1,
+      });
+
+      selectedActions = extractedActions.filter((a) => selected.includes(a.name));
+    }
+
+    if (selectedActions.length === 0) {
+      throw new Error('未选择任何 action。');
+    }
+
+    const description = input.overrides?.description
+      ?? (input.yes
+        ? `SDK CLI: ${detection.moduleName ?? detection.language}`
+        : await adapter.input({
+            message: 'CLI 描述',
+            defaultValue: `SDK CLI: ${detection.moduleName ?? detection.language}`,
+          }));
+    const packageName = input.overrides?.packageName
+      ?? defaultPackageName(input.name, config.defaults.packageScope);
+
+    // Generate wrapper source code
+    const codegenResult = generateSdkWrapper(input.name, detection, selectedActions);
+
+    // Write wrapper files to a subfolder in targetDir
+    const wrapperDir = path.join(targetDir, 'sdk-wrapper');
+    await writeSdkWrapper(wrapperDir, codegenResult);
+    debugLog(input.verbose, `generated wrapper in: ${wrapperDir}`);
+
+    // Create manifest actions
+    const builtAt = new Date().toISOString();
+    let manifest = existingManifest;
+
+    for (const sdkAction of selectedActions) {
+      const commandPath = input.overrides?.commandPath
+        ? [...input.overrides.commandPath, sdkAction.name]
+        : (sdkAction.receiver
+          ? [sdkAction.receiver.toLowerCase(), sdkAction.name]
+          : [sdkAction.name]);
+
+      const action: GeneratedCliAction = {
+        commandPath,
+        description: sdkAction.description ?? sdkAction.name,
+        endpoint: {
+          type: 'sdk',
+          language: detection.language,
+          wrapperDir,
+          buildCommand: codegenResult.buildConfig.command,
+          requires: codegenResult.buildConfig.requires,
+          sdkRoot: detection.rootDir,
+          moduleName: detection.moduleName,
+          callConventionKind: detection.callConvention?.kind,
+          callConventionInferredBy: detection.callConvention?.inferredBy,
+        },
+        params: sdkAction.params.map((p) => ({
+          name: p.name,
+          type: p.type,
+          required: p.required,
+          description: p.description ?? p.rawType,
+          location: 'body' as const,
+          flag: `--${p.name}`,
+        })),
+        examples: [],
+        authHints: [],
+        meta: {
+          provider: input.name,
+          service: sdkAction.receiver ?? detection.language,
+          action: sdkAction.name,
+          source: detection.rootDir,
+          builtAt,
+        },
+      };
+
+      manifest = mergeActionIntoManifest(
+        manifest,
+        input.name,
+        packageName,
+        description,
+        action,
+      );
+    }
+
+    const generated = await writeGeneratedPackage({
+      targetDir,
+      cliName: input.name,
+      packageName,
+      manifest: manifest!,
+    });
+
+    let shimFilePath: string | undefined;
+    if (installBinDir) {
+      shimFilePath = await installCommandShim({
+        cliName: input.name,
+        entryFilePath: generated.entryFilePath,
+        installBinDir,
+      });
+    }
+
+    const record: BuiltCliRecord = {
+      name: input.name,
+      packageName,
+      targetDir,
+      manifestFilePath: generated.manifestFilePath,
+      entryFilePath: generated.entryFilePath,
+      shimFilePath,
+      commandPath: selectedActions.length === 1
+        ? (selectedActions[0].receiver
+          ? [selectedActions[0].receiver.toLowerCase(), selectedActions[0].name]
+          : [selectedActions[0].name])
+        : [input.name],
+      source: detection.rootDir,
+      builtAt,
+    };
+    await upsertBuiltCliRecord(record);
+
+    // Log build instructions
+    console.log(`\nSDK wrapper 已生成: ${wrapperDir}`);
+    console.log(`语言: ${detection.language}`);
+    console.log(`编译命令: ${codegenResult.buildConfig.command.replace('{{output}}', input.name).replace('{{name}}', input.name)}`);
+    console.log(`环境要求: ${codegenResult.buildConfig.requires.join(', ')}`);
+    console.log(`\n导入了 ${selectedActions.length} 个 action:`);
+    for (const a of selectedActions) {
+      console.log(`  - ${a.name}${a.description ? ` — ${a.description}` : ''}`);
+    }
+
+    return {
+      targetDir,
+      packageFilePath: generated.packageFilePath,
+      manifestFilePath: generated.manifestFilePath,
+      entryFilePath: generated.entryFilePath,
+      shimFilePath,
+      specFilePath: generated.manifestFilePath,
+      commandPath: selectedActions.length === 1
+        ? (selectedActions[0].receiver
+          ? [selectedActions[0].receiver.toLowerCase(), selectedActions[0].name]
+          : [selectedActions[0].name])
+        : [input.name],
+    };
+  } finally {
+    if (ownsAdapter) {
+      await adapter.close?.();
+    }
+  }
 }
 
 async function buildCommandCli(
@@ -705,7 +944,8 @@ export function formatCommandTree(manifest: GeneratedCliManifest): string {
       const connector = last ? '└── ' : '├── ';
       const childPrefix = last ? '    ' : '│   ';
       const desc = child.action ? ` — ${child.action.description || ''}` : '';
-      const typeTag = child.action?.endpoint.type === 'command' ? ' [cmd]' : '';
+      const typeTag = child.action?.endpoint.type === 'command' ? ' [cmd]'
+        : child.action?.endpoint.type === 'sdk' ? ` [sdk:${(child.action.endpoint as SdkEndpoint).language}]` : '';
       const leafMarker = child.action ? ' ●' : '';
       lines.push(`${prefix}${connector}${key}${leafMarker}${typeTag}${desc}`);
       walk(child, prefix + childPrefix, false);
@@ -1222,7 +1462,7 @@ function renderGeneratedCliEntry(): string {
     '      var leafActions = getAllLeafActions(cur);',
     '      if (cur.actions.length === 1 && Object.keys(cur.children).length === 0) {',
     '        var action = cur.actions[0];',
-    "        var typeTag = action.endpoint && action.endpoint.type === 'command' ? ' [cmd]' : '';",
+    "        var typeTag = action.endpoint && action.endpoint.type === 'command' ? ' [cmd]' : (action.endpoint && action.endpoint.type === 'sdk' ? ' [sdk]' : '');",
     "        var desc = action.description ? ' — ' + action.description : '';",
     '        var params = action.params || [];',
     "        var reqParams = params.filter(function(p) { return p.required; });",
@@ -1235,7 +1475,7 @@ function renderGeneratedCliEntry(): string {
     '    }',
     '    for (var a = 0; a < nd.actions.length; a++) {',
     '      var action = nd.actions[a];',
-    "      var typeTag = action.endpoint && action.endpoint.type === 'command' ? ' [cmd]' : '';",
+    "      var typeTag = action.endpoint && action.endpoint.type === 'command' ? ' [cmd]' : (action.endpoint && action.endpoint.type === 'sdk' ? ' [sdk]' : '');",
     "      var desc = action.description ? ' — ' + action.description : '';",
     '      var params = action.params || [];',
     "      var reqParams = params.filter(function(p) { return p.required; });",
@@ -1289,6 +1529,21 @@ function renderGeneratedCliEntry(): string {
     "    console.log('All arguments after the command path are passed through to the underlying binary.');",
     '    return;',
     '  }',
+    "  if (action.endpoint && action.endpoint.type === 'sdk') {",
+    "    console.log('Type: SDK (' + action.endpoint.language + ')');",
+    "    console.log('SDK root: ' + action.endpoint.sdkRoot);",
+    "    console.log('Wrapper: ' + action.endpoint.wrapperDir);",
+    "    console.log('Build: ' + action.endpoint.buildCommand);",
+    "    console.log('');",
+    "    console.log('Usage:');",
+    "    console.log('  ' + manifest.cliName + ' ' + action.commandPath.join(' ') + ' [options]');",
+    "    console.log('');",
+    "    console.log('Options:');",
+    '    for (const param of action.params) {',
+    "      console.log('  ' + param.flag + (param.required ? ' (required)' : '') + '  ' + (param.description || param.type));",
+    '    }',
+    '    return;',
+    '  }',
     "  console.log('Usage:');",
     "  console.log('  ' + manifest.cliName + ' ' + action.commandPath.join(' ') + ' [options]');",
     "  console.log('');",
@@ -1329,6 +1584,51 @@ function renderGeneratedCliEntry(): string {
     '  });',
     '  child.on("error", function(err) {',
     "    console.error('Failed to run ' + ep.bin + ': ' + err.message);",
+    '    process.exitCode = 1;',
+    '  });',
+    '}',
+    '',
+    '// ── SDK-type execution: parse flags and run wrapper ──',
+    'function runSdkAction(action, restArgs) {',
+    '  const ep = action.endpoint;',
+    '  // Parse --flag value pairs from restArgs',
+    '  const sdkArgs = [action.commandPath[action.commandPath.length - 1]];',
+    '  for (let i = 0; i < restArgs.length; i++) {',
+    '    sdkArgs.push(restArgs[i]);',
+    '  }',
+    '',
+    '  // Determine runtime command based on language',
+    '  var cmd, cmdArgs;',
+    "  if (ep.language === 'go') {",
+    "    cmd = 'go';",
+    "    cmdArgs = ['run', '.'].concat(sdkArgs);",
+    "  } else if (ep.language === 'rust') {",
+    "    cmd = 'cargo';",
+    "    cmdArgs = ['run', '--'].concat(sdkArgs);",
+    "  } else if (ep.language === 'typescript') {",
+    "    cmd = 'node';",
+    "    var entryFile = path.join(ep.wrapperDir, 'index.js');",
+    '    cmdArgs = [entryFile].concat(sdkArgs);',
+    "  } else if (ep.language === 'python') {",
+    "    cmd = 'python3';",
+    "    var entryFile = path.join(ep.wrapperDir, '__main__.py');",
+    '    cmdArgs = [entryFile].concat(sdkArgs);',
+    '  } else {',
+    "    console.error('Unsupported SDK language: ' + ep.language);",
+    '    process.exitCode = 1;',
+    '    return;',
+    '  }',
+    '',
+    "  var cwd = (ep.language === 'go' || ep.language === 'rust') ? ep.wrapperDir : undefined;",
+    '  var child = spawn(cmd, cmdArgs, {',
+    '    stdio: "inherit",',
+    '    cwd: cwd,',
+    '  });',
+    '  child.on("close", function(code) {',
+    '    process.exitCode = code || 0;',
+    '  });',
+    '  child.on("error", function(err) {',
+    "    console.error('Failed to run SDK action: ' + err.message);",
     '    process.exitCode = 1;',
     '  });',
     '}',
@@ -1469,6 +1769,12 @@ function renderGeneratedCliEntry(): string {
     '  // If matched a command-type action, passthrough everything',
     "  if (fullMatch && fullMatch.action.endpoint && fullMatch.action.endpoint.type === 'command') {",
     '    runCommand(fullMatch.action, fullMatch.rest);',
+    '    return;',
+    '  }',
+    '',
+    '  // If matched an SDK-type action, run via wrapper',
+    "  if (fullMatch && fullMatch.action.endpoint && fullMatch.action.endpoint.type === 'sdk') {",
+    '    runSdkAction(fullMatch.action, fullMatch.rest);',
     '    return;',
     '  }',
     '',

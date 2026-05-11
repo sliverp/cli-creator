@@ -43,7 +43,7 @@ export async function runCli(argv = process.argv): Promise<void> {
   program
     .command('build [name]')
     .description('首次构建一个可全局使用的 CLI（已存在请用 update add）')
-    .option('--from <source>', '文档来源，本地文件路径或 URL')
+    .option('--from <source>', '来源：文档路径/URL，或 SDK（go:./sdk/ / python:requests==1.1.1 / js:sharp@latest）')
     .option('--to <directory>', '生成输出目录')
     .option('--verbose', '打开调试日志')
     .option('--yes', '跳过交互确认，使用默认建议值')
@@ -62,6 +62,8 @@ export async function runCli(argv = process.argv): Promise<void> {
         console.error(`error: 缺少必填参数: ${missing.join(', ')}\n`);
         console.error('示例:');
         console.error('  clix build myapi --from ./docs/api.md');
+        console.error('  clix build mytools --from go:./image-sdk/');
+        console.error('  clix build pytools --from python:requests==1.1.1');
         console.error('  clix build petstore --from https://example.com/openapi.yaml --to ./output\n');
         command.help();
         return;
@@ -91,7 +93,7 @@ export async function runCli(argv = process.argv): Promise<void> {
         console.log(`- command: ${result.shimFilePath}`);
       }
       console.log(`\n使用: ${name} ${result.commandPath.join(' ')} --help`);
-      console.log(`增量添加: clix update ${name} add --from <另一个文档>`);
+      console.log(`增量添加: clix update ${name} add --from <来源>`);
     });
 
   // ── update <name> [add|delete|move|edit] ───────────────────────────
@@ -305,6 +307,7 @@ function printUpdateHelp(): void {
   console.log('');
   console.log('示例:');
   console.log('  clix update myapi add --from ./docs/api.md');
+  console.log('  clix update mytools add --from go:./another-sdk/');
   console.log('  clix update myapi delete cdb/StartCpuExpand');
   console.log('  clix update myapi -h');
   console.log('  clix update myapi delete -h');
@@ -345,7 +348,7 @@ async function handleUpdateAdd(name: string, rest: string[]): Promise<void> {
     console.log('从文档导入并添加 action 到已有 CLI。');
     console.log('');
     console.log('Options:');
-    console.log('  --from <source>         文档来源（本地文件路径或 URL）');
+    console.log('  --from <source>         来源：文档路径/URL 或 SDK（go:./sdk/ / js:pkg@ver）');
     console.log('  --to <directory>        生成输出目录');
     console.log('  --path <segments>       命令层级路径');
     console.log('  --description <desc>    action 描述');

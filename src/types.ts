@@ -4,6 +4,66 @@ export type ContentType = 'markdown' | 'html' | 'pdf' | 'text';
 export type ContentTypeOption = ContentType | 'auto';
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'DELETE' | 'PATCH' | 'HEAD' | 'OPTIONS';
 export type ParamType = 'string' | 'number' | 'boolean' | 'array' | 'object' | 'unknown';
+export type SdkLanguage = 'go' | 'rust' | 'typescript' | 'python';
+
+/**
+ * Language aliases accepted in `--from lang:spec` syntax.
+ * Maps user-facing short names to canonical SdkLanguage values.
+ */
+export const SDK_LANGUAGE_ALIASES: Record<string, SdkLanguage> = {
+  go: 'go',
+  rust: 'rust',
+  rs: 'rust',
+  typescript: 'typescript',
+  ts: 'typescript',
+  javascript: 'typescript', // treat JS as TS internally
+  js: 'typescript',
+  python: 'python',
+  py: 'python',
+};
+
+/**
+ * Parsed result from `--from lang:spec` syntax.
+ *
+ * Examples:
+ *   go:./image-sdk/          → { language: 'go', spec: './image-sdk/', isRemote: false }
+ *   python:requests==1.1.1   → { language: 'python', spec: 'requests==1.1.1', isRemote: true }
+ *   js:sharp@latest          → { language: 'typescript', spec: 'sharp@latest', isRemote: true }
+ *   go:github.com/foo/bar    → { language: 'go', spec: 'github.com/foo/bar', isRemote: true }
+ *   ./docs/api.md            → null (not SDK format)
+ */
+export interface SdkSourceSpec {
+  language: SdkLanguage;
+  /** The part after `lang:` — can be a local path or a package specifier */
+  spec: string;
+  /** True when spec looks like a remote package (not a local path) */
+  isRemote: boolean;
+}
+
+/**
+ * Parse the `--from` value. If it matches `lang:spec`, returns SdkSourceSpec.
+ * Otherwise returns null (the value is a plain path/URL, handled by existing flow).
+ */
+export function parseSdkSource(from: string): SdkSourceSpec | null {
+  // Match lang:spec — the colon must come after a short alphabetic prefix
+  // Exclude URLs like https://... and Windows paths like C:\...
+  const match = from.match(/^([a-zA-Z]{1,12}):(.+)$/);
+  if (!match) return null;
+
+  const prefix = match[1].toLowerCase();
+  const spec = match[2];
+
+  // Exclude URL schemes
+  if (['http', 'https', 'ftp', 'file'].includes(prefix)) return null;
+
+  const language = SDK_LANGUAGE_ALIASES[prefix];
+  if (!language) return null;
+
+  // Determine if spec is a local path or remote package
+  const isRemote = !spec.startsWith('./') && !spec.startsWith('/') && !spec.startsWith('../') && !spec.startsWith('~');
+
+  return { language, spec, isRemote };
+}
 export type DraftStatus = 'draft' | 'approved' | 'rejected';
 export type ReviewStatus = 'needs_attention' | 'ready' | 'approved' | 'rejected';
 
